@@ -12,11 +12,36 @@ use std::env;
 use std::fs::File;
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::process::exit;
 
-use nix::fcntl::{splice, SpliceFFlags};
+use nix::fcntl::{F_SETFL, F_GETFL, fcntl, OFlag, splice, SpliceFFlags};
+use nix::libc::EXIT_FAILURE;
+use nix::sys::stat::fstat;
 use nix::unistd::pipe;
 
 const BUF_SIZE: usize = 16384;
+
+macro_rules! fatal {
+    ($($arg:tt)*) => { eprintln!($($arg)*); exit(EXIT_FAILURE); };
+}
+
+fn remove_append_from_fd(fd: RawFd) {
+    let raw_flags = fcntl(fd, F_GETFL).unwrap();
+    let flags = unsafe { OFlag::from_bits_unchecked(raw_flags) };
+    if flags.contains(OFlag::O_APPEND) {
+        eprintln!("Removing O_APPEND from stdout");
+        fcntl(fd, F_SETFL(flags ^ OFlag::O_APPEND)).unwrap();
+    }
+    let raw_flags = fcntl(fd, F_GETFL).unwrap();
+    let flags = unsafe { OFlag::from_bits_unchecked(raw_flags) };
+    if flags.contains(OFlag::O_APPEND) {
+        fatal!("Failed to remove O_APPEND from stdout");
+    }
+}
+
+fn is_fd_open(fd: RawFd) -> bool {
+    fstat(fd).map_or(false, |s| s.st_nlink > 0)
+}
 
 #[inline]
 fn cat<T: AsRawFd>(input: &T, pipe_rd: RawFd, pipe_wr: RawFd) {
@@ -52,19 +77,31 @@ fn cat<T: AsRawFd>(input: &T, pipe_rd: RawFd, pipe_wr: RawFd) {
     }
 }
 
+#[inline]
+fn cat_stdin(pipe_rd: RawFd, pipe_wr: RawFd, is_stdin_open: bool) {
+    if !is_stdin_open {
+        fatal!("stdin unavailable");
+    }
+    let stdin = io::stdin();
+    let _handle = stdin.lock();
+    cat(&stdin, pipe_rd, pipe_wr);
+}
+
 fn main() {
+    if !is_fd_open(io::stdout().as_raw_fd()) {
+        fatal!("stdout unavailable");
+    }
+    remove_append_from_fd(io::stdout().as_raw_fd());
+    let is_stdin_open = is_fd_open(io::stdin().as_raw_fd()); // must call this before pipe()
+
     let args: Vec<_> = env::args().skip(1).collect();
     let (pipe_rd, pipe_wr) = pipe().unwrap();
     if args.is_empty() {
-        let stdin = io::stdin();
-        let _handle = stdin.lock();
-        cat(&stdin, pipe_rd, pipe_wr);
+        cat_stdin(pipe_rd, pipe_wr, is_stdin_open);
     } else {
         for path in args.into_iter() {
             if path == "-" {
-                let stdin = io::stdin();
-                let _handle = stdin.lock();
-                cat(&stdin, pipe_rd, pipe_wr);
+                cat_stdin(pipe_rd, pipe_wr, is_stdin_open);
             } else {
                 cat(
                     &File::open(&path)
